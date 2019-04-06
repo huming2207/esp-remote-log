@@ -3,15 +3,20 @@
 
 #include <esp_system.h>
 #include <esp_log.h>
-#include <sys/socket.h>
+
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include <lwip/netdb.h>
 
 
 #include "remote_log.h"
 
 #define TAG "remote_log"
-#define LOG_PORT 9527
+#define LOG_PORT 23
 
-static int log_serv_sockfd = 0;
+static int log_serv_sockfd = -1;
+static int log_sockfd = -1;
 static struct sockaddr_in log_serv_addr, log_cli_addr;
 static char fmt_buf[LOG_FORMAT_BUF_LEN];
 static vprintf_like_t orig_vprintf_cb;
@@ -40,8 +45,10 @@ static int remote_log_vprintf_cb(const char *str, va_list list)
         len = vsprintf((char*)fmt_buf, str, list);
 
         // Send off the formatted payload
-        if((ret = write(log_serv_sockfd, fmt_buf, len) < 0)) {
-            ESP_LOGE(TAG, "Oops, failed to send the message to clients");
+        if((ret = send(log_sockfd, fmt_buf, len, 0)) < 0) {
+            ESP_LOGE(TAG, "Oops, failed to send the message to clients, send returns %d, %s",
+                    ret, strerror(errno));
+            remote_log_free();
         }
     }
 
@@ -51,52 +58,65 @@ static int remote_log_vprintf_cb(const char *str, va_list list)
 int remote_log_init()
 {
     int ret = 0;
-    char input_buf[3];
-    if((log_serv_sockfd = socket(AF_INET, SOCK_STREAM, 0) < 0)) {
-        ESP_LOGE(TAG, "Failed to create socket, fd value: %d", log_serv_sockfd);
-        return log_serv_sockfd;
-    }
 
     memset(&log_serv_addr, 0, sizeof(log_serv_addr));
     memset(&log_cli_addr, 0, sizeof(log_cli_addr));
 
-    log_serv_addr.sin_family = AF_INET;
     log_serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    log_serv_addr.sin_family = AF_INET;
     log_serv_addr.sin_port = htons(LOG_PORT);
 
-    if((ret = bind(log_serv_sockfd, (const struct sockaddr *)&log_serv_addr, sizeof(log_serv_addr))) != 0) {
-        ESP_LOGE(TAG, "Failed to bind the port, maybe someone is using it??");
+    if((log_serv_sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP)) < 0) {
+        ESP_LOGE(TAG, "Failed to create socket, fd value: %d", log_serv_sockfd);
+        return log_serv_sockfd;
+    }
+
+    ESP_LOGI(TAG, "Socket FD is %d", log_serv_sockfd);
+
+    int reuse_option = 1;
+    if((ret = setsockopt(log_serv_sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse_option, sizeof(reuse_option))) < 0) {
+        ESP_LOGE(TAG, "Failed to set reuse, returned %d, %s", ret, strerror(errno));
+        remote_log_free();
         return ret;
     }
 
-    if((ret = listen(log_serv_sockfd, 5)) != 0) {
+    if((ret = bind(log_serv_sockfd, (struct sockaddr *)&log_serv_addr, sizeof(log_serv_addr))) < 0) {
+        ESP_LOGE(TAG, "Failed to bind the port, maybe someone is using it?? Reason: %d, %s", ret, strerror(errno));
+        remote_log_free();
+        return ret;
+    }
+
+    if((ret = listen(log_serv_sockfd, 1)) != 0) {
         ESP_LOGE(TAG, "Failed to listen, returned: %d", ret);
         return ret;
     }
 
     // Set timeout
     struct timeval timeout = {
-            .tv_sec = 10,
+            .tv_sec = 30,
             .tv_usec = 0
     };
 
     // Set receive timeout
     if ((ret = setsockopt(log_serv_sockfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout))) < 0) {
         ESP_LOGE(TAG, "Setting receive timeout failed");
+        remote_log_free();
         return ret;
     }
 
     // Set send timeout
     if ((ret = setsockopt(log_serv_sockfd, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout))) < 0) {
         ESP_LOGE(TAG, "Setting send timeout failed");
+        remote_log_free();
         return ret;
     }
 
-    ESP_LOGI(TAG, "Server created, please use telnet to debug me!");
+    ESP_LOGI(TAG, "Server created, please use telnet to debug me in 30 seconds!");
 
     size_t cli_addr_len = sizeof(log_cli_addr);
-    if((ret = accept(log_serv_sockfd, (struct sockaddr *)&log_cli_addr, &cli_addr_len)) != 0) {
-        ESP_LOGE(TAG, "Failed to accept, returned: %d", ret);
+    if((log_sockfd = accept(log_serv_sockfd, (struct sockaddr *)&log_cli_addr, &cli_addr_len)) < 0) {
+        ESP_LOGE(TAG, "Failed to accept, returned: %d, %s", ret, strerror(errno));
+        remote_log_free();
         return ret;
     }
 
