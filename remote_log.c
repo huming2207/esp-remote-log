@@ -45,9 +45,7 @@ static int remote_log_vprintf_cb(const char *str, va_list list)
         len = vsprintf((char*)fmt_buf, str, list);
 
         // Send off the formatted payload
-        if((ret = send(log_sockfd, fmt_buf, len, 0)) < 0) {
-            ESP_LOGE(TAG, "Oops, failed to send the message to clients, send returns %d, %s",
-                    ret, strerror(errno));
+        if(send(log_sockfd, fmt_buf, len, 0) < 0) {
             remote_log_free();
         }
     }
